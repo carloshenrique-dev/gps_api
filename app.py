@@ -1,70 +1,186 @@
-from flask import Flask, request, jsonify
 import numpy as np
-from filterpy.kalman import KalmanFilter
+import sys
+import json
+from flask import Flask, request, jsonify
 
 # Create a Flask app
 app = Flask(__name__)
 
-class SensorFusionKalmanFilter:
-    def __init__(self, state_dimension, measure_dimension):
-      self.kf = KalmanFilter(dim_x=state_dimension, dim_z=measure_dimension)
+np.random.seed(777)
 
-    def predict(self):
-      self.kf.predict()
+sys.path.append('./src')
 
-    def update(self, measurement):
-      self.kf.update(measurement)
+from kalman_filters import ExtendedKalmanFilter as EKF
+from utils import lla_to_enu, enu_to_lla ,normalize_angles, quaternion, madgwickahrs, savitzky_golay_filter
 
- 
+mad_filter = madgwickahrs.MadgwickAHRS(sampleperiod=1, quaternion=quaternion.Quaternion(1, 0, 0, 0), beta=1, zeta=0)
 
-@app.route("/fuse", methods=["POST"])
 
-def fuse():
-    """Fuses sensor data, including accelerometer, gyroscope, latitude, and longitude,
-    using a Kalman filter and returns a more accurate latitude and longitude.
-    Returns:
-        A JSON object containing the fused sensor data, including latitude and longitude.
-    """
+# Renaming and joining
+gyro = []
+accel = []
+magne = []
+yaws = []
+yaw_rates = []
+velocities = []
+trajectory = []
+yaw_rate_noise_std = 0
+initial_yaw_std = 0
 
-    # Get the sensor data from the request body
-    sensor_data = request.get_json()
 
-    # Create a Kalman filter object for sensor fusion
-    kalman_filter = SensorFusionKalmanFilter(state_dimension=6, measure_dimension=6)
+# Inside the `/sensor_data` route
+@app.route('/sensor_data', methods=['POST'])
+def receive_sensor_data():
+    data = request.get_json()
 
-    # Extract accelerometer and gyroscope data
-    accelerometer_reading = np.array(sensor_data["accelerometer"]["reading"])
+    gyro.append(data.get('gyroscope', [0, 0, 0]))
+    accel.append(data.get('accelerometer', [0, 0, 0]))
+    velocities.append([data.get('speed', 0) if data.get(
+        'speed', 0) > 0 else 0, data.get('speedAccuracy', 0) if data.get(
+        'speedAccuracy', 0) > 0 else 0])
+    trajectory.append([data.get('latitude', 0), data.get('longitude', 0), data.get('altitude', 0), data.get('timestamp', 0), data.get('gpsAccuracy', 0)])
 
-    gyroscope_reading = np.array(sensor_data["gyroscope"]["reading"])
+    mad_filter.update_imu(gyro[-1], accel[-1])
 
-    # Concatenate accelerometer and gyroscope readings for sensor fusion
-    measurement = np.concatenate((accelerometer_reading, gyroscope_reading))
+    if len(trajectory) < 2:
+        # Not enough data points for estimation
+        response = {
+            'estimated_x': 0,
+            'estimated_y': 0,
+            'estimated_yaw': 0,
+        }
+        return jsonify(response)
 
-    # Predict the next state
-    kalman_filter.predict()
+    roll, pitch, yaw = mad_filter.quaternion.to_euler_angles()
 
-    # Update the Kalman filter with the sensor measurement
-    kalman_filter.update(measurement)
+    if len(yaws) > 0:
+        last_yaw = yaws[-1]
+    else:
+        last_yaw = yaw
 
-    # Extract latitude and longitude data
-    latitude_readings = [sensor["latitude"] for sensor in sensor_data["sensors"]]
-    longitude_readings = [sensor["longitude"] for sensor in sensor_data["sensors"]]
+    yaw_rate = yaw - last_yaw
+    yaws.append(yaw)
+    yaw_rates.append(yaw_rate)
 
-    # Fuse latitude and longitude data
-    fused_latitude = np.mean(latitude_readings)
-    fused_longitude = np.mean(longitude_readings)
+    trajectoryArray = np.array(trajectory).T
+    yawsArray = np.array(yaws)
+    yaw_rate = np.array(yaw_rates)
+    velocitiesArray = np.array(velocities)
 
-    # Get the state estimate from the Kalman filter
-    state_estimate = kalman_filter.kf.x
+    # Transform GPS trajectory from [lon, lat, alt] to local [x, y, z] coord so that Kalman filter can handle it.
+    origin = trajectoryArray[:, 0]  # set the initial position to the origin
+    gt_trajectory_xyz = lla_to_enu(trajectoryArray, origin)
 
-    # Update the fused sensor data with the fused latitude and longitude
-    state_estimate[0] = fused_latitude
-    state_estimate[1] = fused_longitude
+    xs, ys, _ = gt_trajectory_xyz
 
-    # Return the fused sensor data, including latitude and longitude
-    return jsonify({
-      "fused_reading": state_estimate.tolist()
-    })
+    # Add noise to GPS data
+    #xy_obs_noise_std = 1.0  # Adjust noise level as needed
+    #xy_obs_noise = np.random.normal(0.0, xy_obs_noise_std, (2, 1))  # Assuming one measurement
+
+    #obs_trajectory_xyz = gt_trajectory_xyz.copy()
+    #obs_trajectory_xyz[:2, -1] += xy_obs_noise.flatten()
+
+    # Prepare initial estimate and error covariance
+    #initial_yaw_std = np.pi
+    initial_yaw = yawsArray[0] #np.random.normal(0, initial_yaw_std)
+
+    x = np.array([
+        gt_trajectory_xyz[0, -1],
+        gt_trajectory_xyz[1, -1],
+        initial_yaw
+    ])
+
+    xy_obs_noise_std = trajectory[-1][4]
+
+    # Covariance for initial state estimation error (Sigma_0)
+    P = np.array([
+        [1 ** 2., 0., 0.],
+        [0., 1 ** 2., 0.],
+        [0., 0., 1 ** 2.]
+    ])
+
+    # Prepare measurement error covariance Q
+    Q = np.array([
+        [1 ** 2., 0.],
+        [0., 1 ** 2.]
+    ])
+
+    forward_velocity_noise_std = velocities[-1][1]
+
+    # Prepare state transition noise covariance R
+    R = np.array([
+        [1 ** 2., 0., 0.],
+        [0., 1 ** 2., 0.],
+        [0., 0., 1 ** 2.]
+    ])
+
+    # Initialize Kalman filter
+    kf = EKF(x, P)
+
+    # Arrays to store estimated pose and variance
+    mu_x = [x[0]]
+    mu_y = [x[1]]
+    mu_theta = [x[2]]
+
+    var_x = [P[0, 0]]
+    var_y = [P[1, 1]]
+    var_theta = [P[2, 2]]
+
+    t = trajectory[-1][3]
+    dt = t - trajectory[-2][3]
+
+    # Get control input `u = [v, omega]`
+    u = np.array([
+        velocitiesArray[-1][0],
+        yaw_rate[-1]
+    ])
+
+    # Propagate
+    kf.propagate(u, dt, R)
+
+    # Get measurement `z = [x, y]`
+    z = np.array([
+        gt_trajectory_xyz[0, -1],
+        gt_trajectory_xyz[1, -1]
+    ])
+
+    # Update
+    kf.update(z, Q)
+
+    # Save estimated state
+    mu_x.append(kf.x[0])
+    mu_y.append(kf.x[1])
+    mu_theta.append(normalize_angles(kf.x[2]))
+
+    # Save estimated variance
+    var_x.append(kf.P[0, 0])
+    var_y.append(kf.P[1, 1])
+    var_theta.append(kf.P[2, 2])
+
+    mu_x = np.array(mu_x)
+    mu_y = np.array(mu_y)
+    mu_theta = np.array(mu_theta)
+
+    var_x = np.array(var_x)
+    var_y = np.array(var_y)
+    var_theta = np.array(var_theta)
+
+    # Get the estimated position and orientation
+    estimated_x, estimated_y, estimated_yaw = kf.x
+
+    result = enu_to_lla([estimated_x, estimated_y, 0],origin)
+
+    estimated_location = [float(x) for x in result.T[-1].tolist()]
+
+    # Return the results as a JSON response
+    response = {
+        'estimated_x': estimated_x,
+        'estimated_y': estimated_y,
+        'estimated_yaw': estimated_yaw,
+        'estimated_location': estimated_location,
+    }
+
+    return jsonify(response)
 
 if __name__ == "__main__":
-    app.run()
+    app.run('192.168.15.62')
