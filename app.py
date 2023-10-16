@@ -81,7 +81,7 @@ def receive_sensor_data():
     #obs_trajectory_xyz[:2, -1] += xy_obs_noise.flatten()
 
     # Prepare initial estimate and error covariance
-    #initial_yaw_std = np.pi
+    initial_yaw_std = np.pi
     initial_yaw = yawsArray[0] #np.random.normal(0, initial_yaw_std)
 
     x = np.array([
@@ -94,24 +94,25 @@ def receive_sensor_data():
 
     # Covariance for initial state estimation error (Sigma_0)
     P = np.array([
-        [1 ** 2., 0., 0.],
-        [0., 1 ** 2., 0.],
-        [0., 0., 1 ** 2.]
+        [xy_obs_noise_std ** 2., 0., 0.],
+        [0., xy_obs_noise_std ** 2., 0.],
+        [0., 0., initial_yaw_std ** 2.]
     ])
 
     # Prepare measurement error covariance Q
     Q = np.array([
-        [1 ** 2., 0.],
-        [0., 1 ** 2.]
+        [xy_obs_noise_std ** 2., 0.],
+        [0., xy_obs_noise_std ** 2.]
     ])
 
     forward_velocity_noise_std = velocities[-1][1]
 
+    r_value = 29.0
     # Prepare state transition noise covariance R
     R = np.array([
-        [1 ** 2., 0., 0.],
-        [0., 1 ** 2., 0.],
-        [0., 0., 1 ** 2.]
+        [r_value, 0., 0.],
+        [0., r_value, 0.],
+        [0., 0., r_value]
     ])
 
     # Initialize Kalman filter
@@ -128,6 +129,7 @@ def receive_sensor_data():
 
     t = trajectory[-1][3]
     dt = t - trajectory[-2][3]
+    dt = dt/1000.0
 
     # Get control input `u = [v, omega]`
     u = np.array([
